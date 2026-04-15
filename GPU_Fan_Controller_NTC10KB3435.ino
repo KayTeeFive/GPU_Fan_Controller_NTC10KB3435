@@ -1,202 +1,193 @@
 // ======================================================
 // Arduino UNO Fan Controller with NTC 10K (B=3435)
-// - Measures temperature using NTC thermistor
-// - Controls 4-pin PC fan via PWM (0–5V logic)
-// - Prints voltage, temperature and PWM % to Serial
-// - Failsafe: sensor error or overheat -> fan MAX
-// - Startup visual test sequence
 // ======================================================
 
 #include <avr/wdt.h>
 
-// ---------- Pin configuration ----------
-const int ntcPin = A3;          // Analog pin connected to NTC divider
-const int fanPin = 9;           // PWM output pin for fan control
-const int ledPin = 13;          // Status / error LED
+// ---------- Configuration & Constants ----------
+namespace Config {
+    const int NTC_PIN = A3;
+    const int FAN_PIN = 9;
+    const int LED_PIN = 13;
 
-// ---------- NTC parameters ----------
-const float R0 = 10000.0;       // Resistance at 25°C (Ohms)
-const float T0 = 25.0 + 273.15; // Reference temperature in Kelvin
-const float B  = 3435.0;        // Beta coefficient
-const float Rpd = 10000.0;      // Pull-down resistor value (Ohms)
+    const float R0 = 10000.0;
+    const float T0 = 25.0 + 273.15;
+    const float BETA = 3435.0;
+    const float R_PULLDOWN = 10000.0;
 
-// ---------- Fan curve definition ----------
-// { temperature (°C), PWM (%) }
-const float fanCurve[][2] = {
-  { 39.9,  0.0  },    // Below this value -> FAN is turned OFF
-  { 40.0, 10.0  },
-  { 50.0, 30.0  },
-  { 70.0, 60.0  },
-  { 80.0,100.0  }
+    const float TEMP_HYSTERESIS = 0.5;
+    const int WATCHDOG_TIMEOUT = WDTO_2S;
+}
+
+struct FanPoint {
+    float tempC;
+    float pwmPercent;
 };
 
-const int curvePoints = sizeof(fanCurve) / sizeof(fanCurve[0]);
+// Fan curve definition: { temperature (°C), PWM (%) }
+const FanPoint FAN_CURVE[] = {
+    { 39.9,  0.0  },
+    { 40.0, 10.0  },
+    { 50.0, 30.0  },
+    { 70.0, 60.0  },
+    { 80.0, 100.0 }
+};
 
-// Hysteresis definitions
-const float TEMP_HYSTERESIS = 0.5;                  // 0.5°C hysteresis
-const float TEMP_START_SHIFT = fanCurve[1][0] + 5;  // +5 °C fin start temperature
-bool fanIsOn = false;                               // Control FAN state
-float stableTempC = NAN;                            // Last stabilized temperature
+const int CURVE_POINTS = sizeof(FAN_CURVE) / sizeof(FAN_CURVE[0]);
 
-// ------------------------------------------------------
-// Fan curve interpolation function
-// ------------------------------------------------------
-float getFanPWMPercent(float tempC) {
-
-  // Below first point
-  if (tempC <= fanCurve[0][0]) {
-    fanIsOn = false;
-    return fanCurve[0][1];
-  }
-
-  // Do not start if tempareture is not high enough
-  if (fanIsOn == false && tempC <= TEMP_START_SHIFT) {
-    fanIsOn = false;
-    return fanCurve[0][1];
-  }
-
-  // Now Fan will be started
-  fanIsOn = true;
-
-  // Walk through curve segments
-  for (int i = 0; i < curvePoints - 1; i++) {
-    float t1 = fanCurve[i][0];
-    float p1 = fanCurve[i][1];
-    float t2 = fanCurve[i + 1][0];
-    float p2 = fanCurve[i + 1][1];
-
-    if (tempC >= t1 && tempC <= t2) {
-      // Linear interpolation
-      return p1 + (tempC - t1) * (p2 - p1) / (t2 - t1);
-    }
-  }
-
-  // Above last point -> full speed
-  return 100.0;
-}
+// ---------- Global State ----------
+bool g_fanIsOn = false;
+float g_stableTempC = NAN;
+float g_tempStartShift = 0; // Calculated at runtime based on curve
 
 // ------------------------------------------------------
-// Set PWM output
+// Hardware Interface
 // ------------------------------------------------------
+
 void setFanPWM(int pwmValue) {
-  analogWrite(fanPin, pwmValue);
+    // Ensure PWM stays within valid 8-bit range
+    analogWrite(Config::FAN_PIN, constrain(pwmValue, 0, 255));
+}
+
+void setLed(bool state) {
+    digitalWrite(Config::LED_PIN, state ? HIGH : LOW);
 }
 
 // ------------------------------------------------------
-// Startup fan test sequence
-// 100% -> 20% -> 100% -> 20%
+// Fan Control Logic
 // ------------------------------------------------------
-void pwmTestSequence() {
-  Serial.println("=== Fan Controller Startup Test ===");
-  setFanPWM(255);
-  Serial.println("FAN speed set to MAX for 2 sec...");
-  delay(1000);
-  wdt_reset();  // Reset WATCHDOG
-  delay(1000);
-  setFanPWM((int)(0.2 * 255));
-  Serial.println("FAN speed set to 20% for 2 sec...");
-  delay(1000);
-  wdt_reset();  // Reset WATCHDOG
-  delay(1000);
-  setFanPWM(255);
-  Serial.println("FAN speed set to MAX for 2 sec...");
-  delay(1000);
-  wdt_reset();  // Reset WATCHDOG
-  delay(1000);
-  setFanPWM((int)(0.2 * 255));
-  Serial.println("FAN speed set to 20% for 2 sec...");
-  delay(1000);
-  wdt_reset();  // Reset WATCHDOG
-  delay(1000);
-  Serial.println("Fan Controller Startup Test is Finished!");
+
+float getFanPWMPercent(float tempC) {
+    // 1. Check if temperature is below the absolute minimum (Fan OFF)
+    if (tempC <= FAN_CURVE[0].tempC) {
+        g_fanIsOn = false;
+        return FAN_CURVE[0].pwmPercent;
+    }
+
+    // 2. Startup threshold: prevent frequent oscillations near the start point
+    if (!g_fanIsOn && tempC <= g_tempStartShift) {
+        g_fanIsOn = false;
+        return FAN_CURVE[0].pwmPercent;
+    }
+
+    // 3. Fan is active
+    g_fanIsOn = true;
+
+    // 4. Linear interpolation across the curve segments
+    for (int i = 0; i < CURVE_POINTS - 1; i++) {
+        const FanPoint& p1 = FAN_CURVE[i];
+        const FanPoint& p2 = FAN_CURVE[i + 1];
+
+        if (tempC >= p1.tempC && tempC <= p2.tempC) {
+            return p1.pwmPercent + (tempC - p1.tempC) * (p2.pwmPercent - p1.pwmPercent) / (p2.tempC - p1.tempC);
+        }
+    }
+
+    // 5. Above max threshold
+    return 100.0;
 }
+
+// ------------------------------------------------------
+// Initialization & Test Sequences
+// ------------------------------------------------------
+
+void runStartupSequence() {
+    Serial.println("=== Fan Controller Startup Test ===");
+
+    // Test sequence: 100% -> 20% -> 100% -> 20%
+    for (int i = 0; i < 2; i++) {
+        setFanPWM(255);
+        Serial.println("FAN: MAX (1s)");
+        delay(1000);
+        wdt_reset();
+
+        setFanPWM((int)(0.2 * 255));
+        Serial.println("FAN: 20% (1s)");
+        delay(1000);
+        wdt_reset();
+    }
+    Serial.println("Startup Test Complete.");
+}
+
+// ------------------------------------------------------
+// Main Lifecycle
+// ------------------------------------------------------
 
 void setup() {
-  pinMode(fanPin, OUTPUT);
-  pinMode(ledPin, OUTPUT);
+    pinMode(Config::FAN_PIN, OUTPUT);
+    pinMode(Config::LED_PIN, OUTPUT);
 
-  // FAILSAFE
-  setFanPWM(255);
+    // Initialize hardware to a safe state (Full Speed)
+    setFanPWM(255);
+    wdt_enable(Config::WATCHDOG_TIMEOUT);
 
-  // Start WATCHDOG with 2 second poll
-  wdt_enable(WDTO_2S);
+    Serial.begin(9600);
+    delay(1000);
+    setLed(false);
 
-  Serial.begin(9600);
-  delay(1000);
- 
-  digitalWrite(ledPin, LOW);
+    // Dynamically calculate start shift (Point 1 + 5°C offset)
+    g_tempStartShift = FAN_CURVE[1].tempC + 5.0;
 
-  // Startup fan test sequence
-  pwmTestSequence();
+    runStartupSequence();
 }
 
 void loop() {
-  wdt_reset();  // Reset WATCHDOG
+    wdt_reset();
 
-  // Read voltage from NTC divider
-  float voltage = analogRead(ntcPin) * (5.0 / 1023.0);
+    // 1. Read NTC divider voltage
+    const float voltage = analogRead(Config::NTC_PIN) * (5.0 / 1023.0);
 
-  // Calculate NTC resistance
-  float Rntc = Rpd * (5.0 / voltage - 1.0);
-
-  // Sensor fault detection
-  if (voltage < 0.1 || voltage > 4.9 || Rntc <= 0 || Rntc > 100000.0) {
-    setFanPWM(255);
-    Serial.println("ERROR: NTC sensor failure! Fan forced to 100%");
-
-    // Blink LED to indicate error
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(ledPin, HIGH);
-      delay(100);
-      digitalWrite(ledPin, LOW);
-      delay(100);
-      wdt_reset();  // Reset WATCHDOG
+    // Guard against division by zero/invalid sensor reading
+    if (voltage < 0.01) {
+        setFanPWM(255);
+        Serial.println("CRITICAL: Sensor disconnect (Low Voltage)!");
+        return;
     }
 
+    // 2. Calculate NTC resistance
+    const float Rntc = Config::R_PULLDOWN * (5.0 / voltage - 1.0);
+
+    // 3. Error Checking (Open circuit or Short circuit)
+    if (voltage > 4.9 || Rntc <= 0 || Rntc > 100000.0) {
+        setFanPWM(255);
+        Serial.println("ERROR: NTC Sensor Failure!");
+
+        // Error indication: Rapid LED blink
+        for (int i = 0; i < 5; i++) {
+            setLed(true);
+            delay(100);
+            setLed(false);
+            delay(100);
+            wdt_reset();
+        }
+        delay(500);
+        return;
+    }
+
+    // 4. Temperature Conversion (Beta Equation)
+    const float tempK = 1.0 / ((1.0 / Config::T0) + (1.0 / Config::BETA) * log(Rntc / Config::R0));
+    const float tempC = tempK - 273.15;
+
+    // 5. Apply Temperature Hysteresis
+    if (isnan(g_stableTempC)) {
+        g_stableTempC = tempC;
+    }
+    if (abs(tempC - g_stableTempC) >= Config::TEMP_HYSTERESIS) {
+        g_stableTempC = tempC;
+    }
+
+    // 6. Fan Speed Calculation
+    const float pwmPercent = getFanPWMPercent(g_stableTempC);
+    const int pwmValue = (int)(pwmPercent * 255.0 / 100.0);
+    setFanPWM(pwmValue);
+
+    // 7. Telemetry Output
+    Serial.print("V: "); Serial.print(voltage, 2);
+    Serial.print("V | T_used: "); Serial.print(g_stableTempC, 1);
+    Serial.print(" | T_cur: "); Serial.print(tempC, 1);
+    Serial.print(" | PWM: "); Serial.print(pwmPercent, 1);
+    Serial.println("%");
+
+    setLed(true);
     delay(500);
-    wdt_reset();  // Reset WATCHDOG
-    return;
-  }
-
-  // Calculate temperature using Beta equation
-  float tempK = 1.0 / ((1.0 / T0) + (1.0 / B) * log(Rntc / R0));
-  float tempC = tempK - 273.15;
-
-  // Initialize stabilized temperature on first run
-  if (isnan(stableTempC)) {
-    stableTempC = tempC;
-  }
-
-  // Apply temperature hysteresis
-  float deltaTempC = abs(tempC - stableTempC);
-  if (deltaTempC >= TEMP_HYSTERESIS) {
-    stableTempC = tempC;
-  }
-
-  // Get PWM percentage using stabilized temperature
-  float pwmPercent = getFanPWMPercent(stableTempC);
-
-  // Convert percent to PWM value
-  int pwmValue = (int)(pwmPercent * 255.0 / 100.0);
-  pwmValue = constrain(pwmValue, 0, 255);
-
-  setFanPWM(pwmValue);
-
-  // Debug output
-  Serial.print("Voltage: ");
-  Serial.print(voltage, 2);
-  Serial.print(" V | Temp (used/current/delta): ");
-  Serial.print(stableTempC, 1);
-  Serial.print("/");
-  Serial.print(tempC, 1);
-  Serial.print("/");
-  Serial.print(deltaTempC, 1);
-  Serial.print(" °C | PWM: ");
-  Serial.print(pwmPercent, 1);
-  Serial.println(" %");
-
-  digitalWrite(ledPin, HIGH);
-  delay(500);
-
-  wdt_reset();  // Reset WATCHDOG
 }
